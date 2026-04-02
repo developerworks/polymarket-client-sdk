@@ -378,16 +378,15 @@ pub struct Config {
     #[builder(default = true)]
     http2_adaptive_window: bool,
     /// Connection pool idle timeout. Longer timeout keeps connections alive longer.
-    #[builder(default = "Duration::from_secs(600)")]
+    #[builder(default = Duration::from_secs(600))]
     pool_idle_timeout: Duration,
     /// Maximum number of idle connections per host.
-    #[builder(default = "32")]
+    #[builder(default = 32)]
     pool_max_idle_per_host: usize,
     /// Enable TCP keepalive.
-    #[builder(default = "Some(Duration::from_secs(60))")]
     tcp_keepalive: Option<Duration>,
     /// Connection timeout.
-    #[builder(default = "Duration::from_secs(30)")]
+    #[builder(default = Duration::from_secs(30))]
     timeout: Duration,
 }
 
