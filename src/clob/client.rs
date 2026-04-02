@@ -372,6 +372,23 @@ pub struct Config {
     #[builder(default = Duration::from_secs(5))]
     /// How often the [`Client`] will automatically submit heartbeats. The default is five (5) seconds.
     heartbeat_interval: Duration,
+
+    // ===== 新增 HTTP 优化配置 =====
+    /// Enable HTTP/2 adaptive window size for better throughput.
+    #[builder(default = true)]
+    http2_adaptive_window: bool,
+    /// Connection pool idle timeout. Longer timeout keeps connections alive longer.
+    #[builder(default = "Duration::from_secs(600)")]
+    pool_idle_timeout: Duration,
+    /// Maximum number of idle connections per host.
+    #[builder(default = "32")]
+    pool_max_idle_per_host: usize,
+    /// Enable TCP keepalive.
+    #[builder(default = "Some(Duration::from_secs(60))")]
+    tcp_keepalive: Option<Duration>,
+    /// Connection timeout.
+    #[builder(default = "Duration::from_secs(30)")]
+    timeout: Duration,
 }
 
 impl Default for Config {
@@ -381,6 +398,12 @@ impl Default for Config {
             geoblock_host: None,
             #[cfg(feature = "heartbeats")]
             heartbeat_interval: Duration::from_secs(5),
+            // 新增默认值
+            http2_adaptive_window: true,
+            pool_idle_timeout: Duration::from_secs(600),
+            pool_max_idle_per_host: 32,
+            tcp_keepalive: Some(Duration::from_secs(60)),
+            timeout: Duration::from_secs(30),
         }
     }
 }
@@ -1188,13 +1211,20 @@ impl Client<Unauthenticated> {
     /// ```
     pub fn new(host: &str, config: Config) -> Result<Client<Unauthenticated>> {
         let mut headers = HeaderMap::new();
-
         headers.insert("User-Agent", HeaderValue::from_static("rs_clob_client"));
         headers.insert("Accept", HeaderValue::from_static("*/*"));
         headers.insert("Connection", HeaderValue::from_static("keep-alive"));
         headers.insert("Content-Type", HeaderValue::from_static("application/json"));
 
-        let client = ReqwestClient::builder().default_headers(headers).build()?;
+        // 使用配置构建 reqwest client
+        let client = ReqwestClient::builder()
+            .default_headers(headers)
+            .http2_adaptive_window(config.http2_adaptive_window)
+            .pool_idle_timeout(config.pool_idle_timeout)
+            .pool_max_idle_per_host(config.pool_max_idle_per_host)
+            .tcp_keepalive(config.tcp_keepalive)
+            .timeout(config.timeout)
+            .build()?;
 
         let geoblock_host = Url::parse(
             config
