@@ -1217,6 +1217,11 @@ impl Client<Unauthenticated> {
 
         // 使用配置构建 reqwest client
         let client = ReqwestClient::builder()
+            .tcp_nodelay(true)
+            .http2_prior_knowledge()
+            .http2_keep_alive_while_idle(true)
+            .http2_keep_alive_interval(Duration::from_secs(60))
+            .http2_keep_alive_timeout(Duration::from_secs(600))
             .default_headers(headers)
             .http2_adaptive_window(config.http2_adaptive_window)
             .pool_idle_timeout(config.pool_idle_timeout)
