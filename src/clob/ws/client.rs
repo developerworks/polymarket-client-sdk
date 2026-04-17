@@ -407,15 +407,23 @@ impl<S: State> Client<S> {
             .sum()
     }
 
+    /// Unsubscribe from raw market messages for specific assets.
+    ///
+    /// This decrements the reference count for each asset. The server unsubscribe
+    /// is only sent when no other subscriptions are using those assets.
+    pub fn unsubscribe_market(&self, asset_ids: &[U256]) -> Result<()> {
+        self.inner
+            .unsubscribe_and_cleanup(ChannelType::Market, |subs| {
+                subs.unsubscribe_market(asset_ids)
+            })
+    }
+
     /// Unsubscribe from orderbook updates for specific assets.
     ///
     /// This decrements the reference count for each asset. The server unsubscribe
     /// is only sent when no other subscriptions are using those assets.
     pub fn unsubscribe_orderbook(&self, asset_ids: &[U256]) -> Result<()> {
-        self.inner
-            .unsubscribe_and_cleanup(ChannelType::Market, |subs| {
-                subs.unsubscribe_market(asset_ids)
-            })
+        self.unsubscribe_market(asset_ids)
     }
 
     /// Unsubscribe from price changes for specific assets.

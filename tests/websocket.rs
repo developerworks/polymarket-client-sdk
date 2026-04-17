@@ -1387,6 +1387,25 @@ mod unsubscribe_variants {
     use super::*;
 
     #[tokio::test]
+    async fn unsubscribe_market_sends_request() {
+        let mut server = MockWsServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+
+        let client = Client::new(&endpoint, Config::default()).unwrap();
+
+        let asset_id = payloads::asset_id();
+
+        let _stream = client.subscribe_market(vec![asset_id]).unwrap();
+        let _: Option<String> = server.recv_subscription().await;
+
+        client.unsubscribe_market(&[asset_id]).unwrap();
+
+        let unsub = server.recv_subscription().await.unwrap();
+        assert!(unsub.contains("\"operation\":\"unsubscribe\""));
+        assert!(unsub.contains(&asset_id.to_string()));
+    }
+
+    #[tokio::test]
     async fn unsubscribe_prices_sends_request() {
         let mut server = MockWsServer::start().await;
         let endpoint = server.ws_url("/ws/market");
