@@ -306,6 +306,38 @@ mod market_channel {
     }
 
     #[tokio::test]
+    async fn subscribe_market_receives_multiple_market_message_types_on_one_stream() {
+        let mut server = MockWsServer::start().await;
+        let endpoint = server.ws_url("/ws/market");
+
+        let config = Config::default();
+        let client = Client::new(&endpoint, config).unwrap();
+
+        let asset_id = payloads::asset_id();
+        let stream = client.subscribe_market(vec![asset_id]).unwrap();
+        let mut stream = Box::pin(stream);
+
+        let sub_request = server.recv_subscription().await.unwrap();
+        assert!(sub_request.contains("\"type\":\"market\""));
+        assert!(sub_request.contains(&asset_id.to_string()));
+
+        server.send(&payloads::book().to_string());
+        let first = timeout(Duration::from_secs(2), stream.next()).await;
+        let first = first.unwrap().unwrap().unwrap();
+        assert!(matches!(first, WsMessage::Book(_)));
+
+        server.send(&payloads::price_change_batch(asset_id).to_string());
+        let second = timeout(Duration::from_secs(2), stream.next()).await;
+        let second = second.unwrap().unwrap().unwrap();
+        assert!(matches!(second, WsMessage::PriceChange(_)));
+
+        server.send(&payloads::last_trade_price(payloads::ASSET_ID_STR).to_string());
+        let third = timeout(Duration::from_secs(2), stream.next()).await;
+        let third = third.unwrap().unwrap().unwrap();
+        assert!(matches!(third, WsMessage::LastTradePrice(_)));
+    }
+
+    #[tokio::test]
     async fn subscribe_prices_receives_price_changes() {
         let mut server = MockWsServer::start().await;
         let endpoint = server.ws_url("/ws/market");

@@ -375,6 +375,7 @@ async fn main() -> anyhow::Result<()> {
 ```
 
 Available streams:
+- `subscribe_market()` - Raw parsed market messages on a single stream
 - `subscribe_orderbook()` - Bid/ask levels for assets
 - `subscribe_prices()` - Price change events
 - `subscribe_midpoints()` - Calculated midpoint prices

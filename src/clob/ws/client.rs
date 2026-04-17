@@ -136,6 +136,29 @@ impl Client<Unauthenticated> {
 
 // Methods available in any state
 impl<S: State> Client<S> {
+    /// Subscribes to raw market WebSocket messages for specified assets.
+    ///
+    /// This is the lowest-level market data stream exposed by the SDK. It yields
+    /// every parsed [`WsMessage`] for the subscribed assets on a single receiver,
+    /// which is useful when callers need to handle multiple event types without
+    /// creating multiple filtered subscriptions.
+    ///
+    /// # Arguments
+    ///
+    /// * `asset_ids` - List of asset/token IDs to monitor
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the subscription cannot be created or the WebSocket
+    /// connection is not established.
+    pub fn subscribe_market(
+        &self,
+        asset_ids: Vec<U256>,
+    ) -> Result<impl Stream<Item = Result<WsMessage>> + use<S>> {
+        let resources = self.inner.get_or_create_channel(ChannelType::Market)?;
+        resources.subscriptions.subscribe_market(asset_ids)
+    }
+
     /// Subscribes to real-time orderbook updates for specified market assets.
     ///
     /// Returns a stream of orderbook snapshots showing all bid and ask levels.
@@ -154,8 +177,7 @@ impl<S: State> Client<S> {
         &self,
         asset_ids: Vec<U256>,
     ) -> Result<impl Stream<Item = Result<BookUpdate>> + use<S>> {
-        let resources = self.inner.get_or_create_channel(ChannelType::Market)?;
-        let stream = resources.subscriptions.subscribe_market(asset_ids)?;
+        let stream = self.subscribe_market(asset_ids)?;
 
         Ok(stream.filter_map(|msg_result| async move {
             match msg_result {
@@ -183,8 +205,7 @@ impl<S: State> Client<S> {
         &self,
         asset_ids: Vec<U256>,
     ) -> Result<impl Stream<Item = Result<LastTradePrice>> + use<S>> {
-        let resources = self.inner.get_or_create_channel(ChannelType::Market)?;
-        let stream = resources.subscriptions.subscribe_market(asset_ids)?;
+        let stream = self.subscribe_market(asset_ids)?;
 
         Ok(stream.filter_map(|msg_result| async move {
             match msg_result {
@@ -213,8 +234,7 @@ impl<S: State> Client<S> {
         &self,
         asset_ids: Vec<U256>,
     ) -> Result<impl Stream<Item = Result<PriceChange>> + use<S>> {
-        let resources = self.inner.get_or_create_channel(ChannelType::Market)?;
-        let stream = resources.subscriptions.subscribe_market(asset_ids)?;
+        let stream = self.subscribe_market(asset_ids)?;
 
         Ok(stream.filter_map(|msg_result| async move {
             match msg_result {
@@ -242,8 +262,7 @@ impl<S: State> Client<S> {
         &self,
         asset_ids: Vec<U256>,
     ) -> Result<impl Stream<Item = Result<TickSizeChange>> + use<S>> {
-        let resources = self.inner.get_or_create_channel(ChannelType::Market)?;
-        let stream = resources.subscriptions.subscribe_market(asset_ids)?;
+        let stream = self.subscribe_market(asset_ids)?;
 
         Ok(stream.filter_map(|msg_result| async move {
             match msg_result {
