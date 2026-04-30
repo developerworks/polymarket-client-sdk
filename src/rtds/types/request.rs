@@ -94,6 +94,21 @@ impl Subscription {
         }
     }
 
+    /// Create a subscription for public order matches by event slug.
+    #[must_use]
+    pub fn orders_matched(event_slug: impl AsRef<str>) -> Self {
+        let filter_object = serde_json::json!({ "event_slug": event_slug.as_ref() });
+        let filters = serde_json::to_string(&filter_object.to_string())
+            .expect("orders_matched filter should serialize");
+
+        Self {
+            topic: "activity".to_owned(),
+            msg_type: "orders_matched".to_owned(),
+            filters: Some(filters),
+            clob_auth: None,
+        }
+    }
+
     /// Create a subscription for comments.
     #[must_use]
     pub fn comments(msg_type: Option<CommentType>) -> Self {
@@ -214,6 +229,20 @@ mod tests {
     }
 
     #[test]
+    fn serialize_orders_matched_subscription() {
+        let sub = Subscription::orders_matched("btc-updown-5m-1776116700");
+        let request = SubscriptionRequest::subscribe(vec![sub]);
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"topic\":\"activity\""));
+        assert!(json.contains("\"type\":\"orders_matched\""));
+        assert!(
+            json.contains(r#""filters":"{\"event_slug\":\"btc-updown-5m-1776116700\"}""#),
+            "orders_matched filters should serialize as escaped JSON string, got: {json}"
+        );
+    }
+
+    #[test]
     fn serialize_chainlink_without_filters() {
         // When no symbol is provided, there should be no filters field
         let sub = Subscription::chainlink_prices(None);
@@ -305,6 +334,21 @@ mod tests {
         assert!(json.contains("\"action\":\"unsubscribe\""));
         assert!(json.contains("\"topic\":\"comments\""));
         assert!(json.contains("\"type\":\"comment_created\""));
+    }
+
+    #[test]
+    fn serialize_unsubscribe_orders_matched() {
+        let sub = Subscription::orders_matched("btc-updown-5m-1776116700");
+        let request = SubscriptionRequest::unsubscribe(vec![sub]);
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"action\":\"unsubscribe\""));
+        assert!(json.contains("\"topic\":\"activity\""));
+        assert!(json.contains("\"type\":\"orders_matched\""));
+        assert!(
+            json.contains(r#""filters":"{\"event_slug\":\"btc-updown-5m-1776116700\"}""#),
+            "orders_matched unsubscribe should include filters, got: {json}"
+        );
     }
 
     #[test]

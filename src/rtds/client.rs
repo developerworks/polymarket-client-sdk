@@ -205,6 +205,29 @@ impl<S: State> Client<S> {
         }))
     }
 
+    /// Subscribe to public order matches for a Polymarket event slug.
+    pub fn subscribe_orders_matched(
+        &self,
+        event_slug: impl Into<String>,
+    ) -> Result<impl Stream<Item = Result<RtdsMessage>>> {
+        let event_slug = event_slug.into();
+        let subscription = Subscription::orders_matched(&event_slug);
+        let stream = self.inner.subscriptions.subscribe(subscription)?;
+
+        Ok(stream.filter_map(move |msg_result| {
+            let event_slug = event_slug.clone();
+            async move {
+                match msg_result {
+                    Ok(msg) if message_matches_orders_matched_event_slug(&msg, &event_slug) => {
+                        Some(Ok(msg))
+                    }
+                    Ok(_) => None,
+                    Err(e) => Some(Err(e)),
+                }
+            }
+        }))
+    }
+
     /// Subscribe to raw RTDS messages for a custom topic/type combination.
     pub fn subscribe_raw(
         &self,
@@ -273,6 +296,12 @@ impl<S: State> Client<S> {
         self.inner.subscriptions.unsubscribe(&[topic])
     }
 
+    /// Unsubscribe from public order matches for an event slug.
+    pub fn unsubscribe_orders_matched(&self, event_slug: impl AsRef<str>) -> Result<()> {
+        let subscription = Subscription::orders_matched(event_slug);
+        self.inner.subscriptions.unsubscribe_exact(&[subscription])
+    }
+
     /// Unsubscribe from comment events.
     ///
     /// # Arguments
@@ -287,6 +316,73 @@ impl<S: State> Client<S> {
         });
         let topic = TopicType::new("comments".to_owned(), msg_type);
         self.inner.subscriptions.unsubscribe(&[topic])
+    }
+}
+
+fn message_matches_orders_matched_event_slug(message: &RtdsMessage, event_slug: &str) -> bool {
+    if message.topic != "activity" || message.msg_type != "orders_matched" {
+        return false;
+    }
+
+    message
+        .payload
+        .get("eventSlug")
+        .or_else(|| message.payload.get("event_slug"))
+        .or_else(|| message.payload.get("slug"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value == event_slug)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn orders_matched_filter_accepts_event_slug_shapes() {
+        for payload in [
+            json!({ "eventSlug": "btc-updown-5m-1776116700" }),
+            json!({ "event_slug": "btc-updown-5m-1776116700" }),
+            json!({ "slug": "btc-updown-5m-1776116700" }),
+        ] {
+            let message = RtdsMessage {
+                topic: "activity".to_owned(),
+                msg_type: "orders_matched".to_owned(),
+                timestamp: 1_776_116_825_000,
+                payload,
+            };
+
+            assert!(message_matches_orders_matched_event_slug(
+                &message,
+                "btc-updown-5m-1776116700"
+            ));
+        }
+    }
+
+    #[test]
+    fn orders_matched_filter_rejects_other_topics_or_slugs() {
+        let wrong_slug = RtdsMessage {
+            topic: "activity".to_owned(),
+            msg_type: "orders_matched".to_owned(),
+            timestamp: 1_776_116_825_000,
+            payload: json!({ "eventSlug": "btc-updown-5m-1776117000" }),
+        };
+        let wrong_topic = RtdsMessage {
+            topic: "crypto_prices".to_owned(),
+            msg_type: "orders_matched".to_owned(),
+            timestamp: 1_776_116_825_000,
+            payload: json!({ "eventSlug": "btc-updown-5m-1776116700" }),
+        };
+
+        assert!(!message_matches_orders_matched_event_slug(
+            &wrong_slug,
+            "btc-updown-5m-1776116700"
+        ));
+        assert!(!message_matches_orders_matched_event_slug(
+            &wrong_topic,
+            "btc-updown-5m-1776116700"
+        ));
     }
 }
 

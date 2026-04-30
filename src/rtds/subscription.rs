@@ -47,6 +47,51 @@ impl TopicType {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SubscriptionKey {
+    topic_type: TopicType,
+    filters: Option<String>,
+}
+
+impl SubscriptionKey {
+    fn from_subscription(subscription: &Subscription) -> Self {
+        Self {
+            topic_type: TopicType::new(subscription.topic.clone(), subscription.msg_type.clone()),
+            filters: subscription.filters.clone(),
+        }
+    }
+
+    fn from_info(info: &SubscriptionInfo) -> Self {
+        Self {
+            topic_type: info.topic_type.clone(),
+            filters: info.filters.clone(),
+        }
+    }
+
+    fn matches_topic_type(&self, topic_type: &TopicType) -> bool {
+        self.topic_type == *topic_type
+    }
+
+    fn to_subscription(&self) -> Subscription {
+        Subscription {
+            topic: self.topic_type.topic.clone(),
+            msg_type: self.topic_type.msg_type.clone(),
+            filters: self.filters.clone(),
+            clob_auth: None,
+        }
+    }
+
+    fn active_subscription_id(&self) -> String {
+        match &self.filters {
+            Some(filters) => format!(
+                "{}:{}:{}",
+                self.topic_type.topic, self.topic_type.msg_type, filters
+            ),
+            None => format!("{}:{}", self.topic_type.topic, self.topic_type.msg_type),
+        }
+    }
+}
+
 /// Information about an active subscription.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -65,8 +110,8 @@ pub struct SubscriptionInfo {
 pub struct SubscriptionManager {
     connection: ConnectionManager<RtdsMessage, SimpleParser>,
     active_subs: DashMap<String, SubscriptionInfo>,
-    /// Subscribed topics with reference counts (for multiplexing)
-    subscribed_topics: DashMap<TopicType, usize>,
+    /// Subscribed topic/filter combinations with reference counts (for multiplexing)
+    subscribed_topics: DashMap<SubscriptionKey, usize>,
     last_auth: RwLock<Option<Credentials>>,
 }
 
@@ -178,6 +223,7 @@ impl SubscriptionManager {
         subscription: Subscription,
     ) -> Result<impl Stream<Item = Result<RtdsMessage>>> {
         let topic_type = TopicType::new(subscription.topic.clone(), subscription.msg_type.clone());
+        let subscription_key = SubscriptionKey::from_subscription(&subscription);
 
         // Store auth for re-subscription on reconnect.
         // We can recover from poisoned lock because Option<Credentials> has no inconsistent intermediate state.
@@ -191,7 +237,7 @@ impl SubscriptionManager {
         // Increment refcount or insert new topic with refcount=1
         // Using Entry API to atomically check and update, with send inside the guard
         // to prevent TOCTOU race between refcount check and network send
-        match self.subscribed_topics.entry(topic_type.clone()) {
+        match self.subscribed_topics.entry(subscription_key.clone()) {
             Entry::Occupied(mut entry) => {
                 *entry.get_mut() += 1;
                 #[cfg(feature = "tracing")]
@@ -219,7 +265,7 @@ impl SubscriptionManager {
         }
 
         // Register subscription info
-        let sub_id = format!("{}:{}", topic_type.topic, topic_type.msg_type);
+        let sub_id = subscription_key.active_subscription_id();
         self.active_subs.insert(
             sub_id,
             SubscriptionInfo {
@@ -278,9 +324,9 @@ impl SubscriptionManager {
 
     /// Unsubscribe from topics.
     ///
-    /// This decrements the reference count for each topic. Only sends an unsubscribe
-    /// request to the server when the reference count reaches zero (no other streams
-    /// are using that topic).
+    /// This decrements the reference count for every active filter variant of each
+    /// topic. Only sends an unsubscribe request to the server when the reference
+    /// count reaches zero (no other streams are using that topic/filter pair).
     pub fn unsubscribe(&self, topic_types: &[TopicType]) -> Result<()> {
         if topic_types.is_empty() {
             return Err(RtdsError::SubscriptionFailed(
@@ -290,37 +336,71 @@ impl SubscriptionManager {
             .into());
         }
 
+        let subscription_keys = topic_types
+            .iter()
+            .flat_map(|topic_type| {
+                self.subscribed_topics
+                    .iter()
+                    .filter(move |entry| entry.key().matches_topic_type(topic_type))
+                    .map(|entry| entry.key().clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        self.unsubscribe_keys(&subscription_keys)
+    }
+
+    /// Unsubscribe from exact subscriptions, including their filters.
+    pub fn unsubscribe_exact(&self, subscriptions: &[Subscription]) -> Result<()> {
+        if subscriptions.is_empty() {
+            return Err(RtdsError::SubscriptionFailed(
+                "subscriptions cannot be empty: at least one subscription must be provided for unsubscription"
+                    .to_owned(),
+            )
+            .into());
+        }
+
+        let subscription_keys = subscriptions
+            .iter()
+            .map(SubscriptionKey::from_subscription)
+            .collect::<Vec<_>>();
+
+        self.unsubscribe_keys(&subscription_keys)
+    }
+
+    fn unsubscribe_keys(&self, subscription_keys: &[SubscriptionKey]) -> Result<()> {
         // Atomically decrement refcounts and send unsubscribe while holding the entry lock
         // to prevent TOCTOU race between refcount check and network send
-        for topic_type in topic_types {
-            if let Entry::Occupied(mut entry) = self.subscribed_topics.entry(topic_type.clone()) {
+        for subscription_key in subscription_keys {
+            if let Entry::Occupied(mut entry) =
+                self.subscribed_topics.entry(subscription_key.clone())
+            {
                 let refcount = entry.get_mut();
                 *refcount = refcount.saturating_sub(1);
                 if *refcount == 0 {
                     #[cfg(feature = "tracing")]
                     tracing::debug!(
-                        topic = %topic_type.topic,
-                        msg_type = %topic_type.msg_type,
+                        topic = %subscription_key.topic_type.topic,
+                        msg_type = %subscription_key.topic_type.msg_type,
+                        filters = ?subscription_key.filters,
                         "Unsubscribing from RTDS topic"
                     );
 
                     // Send unsubscribe while holding the entry lock to prevent
                     // a concurrent subscribe from racing with us
-                    let request = SubscriptionRequest::unsubscribe(vec![Subscription {
-                        topic: topic_type.topic.clone(),
-                        msg_type: topic_type.msg_type.clone(),
-                        filters: None,
-                        clob_auth: None,
-                    }]);
+                    let request =
+                        SubscriptionRequest::unsubscribe(vec![subscription_key.to_subscription()]);
                     self.connection.send(&request)?;
                     entry.remove();
                 }
             }
         }
 
-        // Remove active_subs entries where all topics are now unsubscribed
-        self.active_subs
-            .retain(|_, info| self.subscribed_topics.contains_key(&info.topic_type));
+        // Remove active_subs entries where all exact topic/filter pairs are now unsubscribed
+        self.active_subs.retain(|_, info| {
+            let subscription_key = SubscriptionKey::from_info(info);
+            self.subscribed_topics.contains_key(&subscription_key)
+        });
 
         Ok(())
     }

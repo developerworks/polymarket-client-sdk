@@ -15,6 +15,7 @@
 //! - **Crypto Prices (Binance)**: Real-time cryptocurrency price data from Binance
 //! - **Crypto Prices (Chainlink)**: Price data from Chainlink oracle networks
 //! - **Comments**: Comment events including creations, removals, and reactions
+//! - **Orders Matched**: Public trade matches filtered by event slug
 //!
 //! # Example
 //!
