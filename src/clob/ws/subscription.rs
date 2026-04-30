@@ -11,7 +11,6 @@ use std::time::Instant;
 use async_stream::try_stream;
 use dashmap::{DashMap, Entry};
 use futures::Stream;
-use tokio::sync::broadcast::error::RecvError;
 
 use super::interest::{InterestTracker, MessageInterest};
 use super::types::request::SubscriptionRequest;
@@ -285,43 +284,28 @@ impl SubscriptionManager {
         let asset_ids_set: HashSet<U256> = asset_ids.into_iter().collect();
 
         Ok(try_stream! {
-            loop {
-                match rx.recv().await {
-                    Ok(msg) => {
-                        // Filter messages by asset_id
-                        let should_yield = match &msg {
-                            WsMessage::Book(book) => asset_ids_set.contains(&book.asset_id),
-                            WsMessage::PriceChange(price) => {
-                                price
-                                    .price_changes
-                                    .iter()
-                                    .any(|pc| asset_ids_set.contains(&pc.asset_id))
-                            },
-                            WsMessage::LastTradePrice(ltp) => asset_ids_set.contains(&ltp.asset_id),
-                            WsMessage::TickSizeChange(tsc) => asset_ids_set.contains(&tsc.asset_id),
-                            WsMessage::BestBidAsk(bba) => asset_ids_set.contains(&bba.asset_id),
-                            WsMessage::NewMarket(nm) => {
-                                nm.asset_ids.iter().any(|id| asset_ids_set.contains(id))
-                            },
-                            WsMessage::MarketResolved(mr) => {
-                                mr.asset_ids.iter().any(|id| asset_ids_set.contains(id))
-                            },
-                            _ => false,
-                        };
+            while let Some(msg) = rx.recv().await {
+                // Filter messages by asset_id
+                let should_yield = match &msg {
+                    WsMessage::Book(book) => asset_ids_set.contains(&book.asset_id),
+                    WsMessage::PriceChange(price) => price
+                        .price_changes
+                        .iter()
+                        .any(|pc| asset_ids_set.contains(&pc.asset_id)),
+                    WsMessage::LastTradePrice(ltp) => asset_ids_set.contains(&ltp.asset_id),
+                    WsMessage::TickSizeChange(tsc) => asset_ids_set.contains(&tsc.asset_id),
+                    WsMessage::BestBidAsk(bba) => asset_ids_set.contains(&bba.asset_id),
+                    WsMessage::NewMarket(nm) => {
+                        nm.asset_ids.iter().any(|id| asset_ids_set.contains(id))
+                    },
+                    WsMessage::MarketResolved(mr) => {
+                        mr.asset_ids.iter().any(|id| asset_ids_set.contains(id))
+                    },
+                    _ => false,
+                };
 
-                        if should_yield {
-                            yield msg
-                        }
-                    }
-                    Err(RecvError::Lagged(n)) => {
-                        #[cfg(not(feature = "tracing"))]
-                        let _ = n;
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!("Subscription lagged, missed {n} messages — continuing");
-                    }
-                    Err(RecvError::Closed) => {
-                        break;
-                    }
+                if should_yield {
+                    yield msg
                 }
             }
         })
@@ -393,22 +377,9 @@ impl SubscriptionManager {
         let mut rx = self.connection.subscribe();
 
         Ok(try_stream! {
-            loop {
-                match rx.recv().await {
-                    Ok(msg) => {
-                        if msg.is_user() {
-                            yield msg;
-                        }
-                    }
-                    Err(RecvError::Lagged(n)) => {
-                        #[cfg(not(feature = "tracing"))]
-                        let _ = n;
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!("Subscription lagged, missed {n} messages — continuing");
-                    }
-                    Err(RecvError::Closed) => {
-                        break;
-                    }
+            while let Some(msg) = rx.recv().await {
+                if msg.is_user() {
+                    yield msg;
                 }
             }
         })

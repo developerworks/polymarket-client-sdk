@@ -5,6 +5,7 @@
 
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use backoff::backoff::Backoff as _;
@@ -12,7 +13,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{interval, sleep, timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
@@ -30,8 +31,7 @@ struct HeartbeatPingRequest {
     sent_tx: oneshot::Sender<Instant>,
 }
 
-/// Broadcast channel capacity for incoming messages.
-const BROADCAST_CAPACITY: usize = 1024;
+type SubscriberList<M> = Arc<Mutex<Vec<mpsc::UnboundedSender<M>>>>;
 
 /// Connection state tracking.
 #[non_exhaustive]
@@ -67,7 +67,7 @@ impl ConnectionState {
 /// - Establishing and maintaining connections
 /// - Automatic reconnection with exponential backoff
 /// - Heartbeat monitoring via PING/PONG
-/// - Broadcasting messages to multiple subscribers
+/// - Fanout of messages to multiple subscribers through unbounded channels
 ///
 /// # Type Parameters
 ///
@@ -86,7 +86,7 @@ impl ConnectionState {
 ///
 /// // Subscribe to messages
 /// let mut rx = connection.subscribe();
-/// while let Ok(msg) = rx.recv().await {
+/// while let Some(msg) = rx.recv().await {
 ///     println!("Received: {:?}", msg);
 /// }
 /// ```
@@ -102,8 +102,8 @@ where
     state_rx: watch::Receiver<ConnectionState>,
     /// Sender channel for outgoing messages
     sender_tx: mpsc::UnboundedSender<String>,
-    /// Broadcast sender for incoming messages
-    broadcast_tx: broadcast::Sender<M>,
+    /// Per-subscriber unbounded queues for incoming messages
+    subscribers: SubscriberList<M>,
     /// Phantom data for unused type parameters
     _phantom: PhantomData<P>,
 }
@@ -120,13 +120,13 @@ where
     /// handles reconnection according to the config's `ReconnectConfig`.
     pub fn new(endpoint: String, config: Config, parser: P) -> Result<Self> {
         let (sender_tx, sender_rx) = mpsc::unbounded_channel();
-        let (broadcast_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
+        let subscribers = Arc::new(Mutex::new(Vec::new()));
         let (state_tx, state_rx) = watch::channel(ConnectionState::Disconnected);
 
         // Spawn connection task
         let connection_config = config;
         let connection_endpoint = endpoint;
-        let broadcast_tx_clone = broadcast_tx.clone();
+        let subscribers_clone = Arc::clone(&subscribers);
         let state_tx_clone = state_tx.clone();
 
         tokio::spawn(async move {
@@ -134,7 +134,7 @@ where
                 connection_endpoint,
                 connection_config,
                 sender_rx,
-                broadcast_tx_clone,
+                subscribers_clone,
                 parser,
                 state_tx_clone,
             )
@@ -145,7 +145,7 @@ where
             state_tx,
             state_rx,
             sender_tx,
-            broadcast_tx,
+            subscribers,
             _phantom: PhantomData,
         })
     }
@@ -155,7 +155,7 @@ where
         endpoint: String,
         config: Config,
         mut sender_rx: mpsc::UnboundedReceiver<String>,
-        broadcast_tx: broadcast::Sender<M>,
+        subscribers: SubscriberList<M>,
         parser: P,
         state_tx: watch::Sender<ConnectionState>,
     ) {
@@ -189,7 +189,7 @@ where
                         ws_stream,
                         endpoint.clone(),
                         &mut sender_rx,
-                        &broadcast_tx,
+                        &subscribers,
                         state_rx,
                         config.clone(),
                         &parser,
@@ -234,7 +234,7 @@ where
         ws_stream: WsStream,
         endpoint: String,
         sender_rx: &mut mpsc::UnboundedReceiver<String>,
-        broadcast_tx: &broadcast::Sender<M>,
+        subscribers: &SubscriberList<M>,
         state_rx: watch::Receiver<ConnectionState>,
         config: Config,
         parser: &P,
@@ -267,7 +267,7 @@ where
                                     for message in messages {
                                         #[cfg(feature = "tracing")]
                                         tracing::trace!(?message, "Parsed WebSocket message");
-                                        _ = broadcast_tx.send(message);
+                                        Self::send_to_subscribers(subscribers, message);
                                     }
                                 }
                                 Err(e) => {
@@ -437,6 +437,13 @@ where
         }
     }
 
+    fn send_to_subscribers(subscribers: &SubscriberList<M>, message: M) {
+        subscribers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|subscriber| subscriber.send(message.clone()).is_ok());
+    }
+
     /// Send a subscription request to the WebSocket server.
     pub fn send<R: Serialize>(&self, request: &R) -> Result<()> {
         let json = serde_json::to_string(request)?;
@@ -467,11 +474,16 @@ where
 
     /// Subscribe to incoming messages.
     ///
-    /// Each call returns a new independent receiver. Multiple subscribers can
-    /// receive messages concurrently without blocking each other.
+    /// Each call returns a new independent unbounded receiver. Multiple
+    /// subscribers can receive messages concurrently without lag-based drops.
     #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<M> {
-        self.broadcast_tx.subscribe()
+    pub fn subscribe(&self) -> mpsc::UnboundedReceiver<M> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.subscribers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(tx);
+        rx
     }
 
     /// Subscribe to connection state changes.

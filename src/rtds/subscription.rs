@@ -9,7 +9,6 @@ use std::time::Instant;
 use async_stream::try_stream;
 use dashmap::{DashMap, Entry};
 use futures::Stream;
-use tokio::sync::broadcast::error::RecvError;
 
 use super::error::RtdsError;
 use super::types::request::{Subscription, SubscriptionRequest};
@@ -282,26 +281,13 @@ impl SubscriptionManager {
         let target_type = topic_type.msg_type;
 
         Ok(try_stream! {
-            loop {
-                match rx.recv().await {
-                    Ok(msg) => {
-                        // Filter messages by topic and type
-                        let matches_topic = msg.topic == target_topic;
-                        let matches_type = target_type == "*" || msg.msg_type == target_type;
+            while let Some(msg) = rx.recv().await {
+                // Filter messages by topic and type
+                let matches_topic = msg.topic == target_topic;
+                let matches_type = target_type == "*" || msg.msg_type == target_type;
 
-                        if matches_topic && matches_type {
-                            yield msg;
-                        }
-                    }
-                    Err(RecvError::Lagged(n)) => {
-                        #[cfg(not(feature = "tracing"))]
-                        let _ = n;
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!("RTDS subscription lagged, missed {n} messages — continuing");
-                    }
-                    Err(RecvError::Closed) => {
-                        break;
-                    }
+                if matches_topic && matches_type {
+                    yield msg;
                 }
             }
         })
