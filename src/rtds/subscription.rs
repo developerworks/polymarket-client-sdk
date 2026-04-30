@@ -351,6 +351,10 @@ impl SubscriptionManager {
     }
 
     /// Unsubscribe from exact subscriptions, including their filters.
+    ///
+    /// If the exact local key is not tracked, this still sends the protocol-level
+    /// unsubscribe request. RTDS supports narrowing a broader subscription, for
+    /// example unsubscribing `activity/trades` after subscribing `activity/*`.
     pub fn unsubscribe_exact(&self, subscriptions: &[Subscription]) -> Result<()> {
         if subscriptions.is_empty() {
             return Err(RtdsError::SubscriptionFailed(
@@ -372,9 +376,11 @@ impl SubscriptionManager {
         // Atomically decrement refcounts and send unsubscribe while holding the entry lock
         // to prevent TOCTOU race between refcount check and network send
         for subscription_key in subscription_keys {
+            let mut found_local_key = false;
             if let Entry::Occupied(mut entry) =
                 self.subscribed_topics.entry(subscription_key.clone())
             {
+                found_local_key = true;
                 let refcount = entry.get_mut();
                 *refcount = refcount.saturating_sub(1);
                 if *refcount == 0 {
@@ -388,11 +394,20 @@ impl SubscriptionManager {
 
                     // Send unsubscribe while holding the entry lock to prevent
                     // a concurrent subscribe from racing with us
-                    let request =
-                        SubscriptionRequest::unsubscribe(vec![subscription_key.to_subscription()]);
-                    self.connection.send(&request)?;
+                    self.send_unsubscribe(subscription_key)?;
                     entry.remove();
                 }
+            }
+
+            if !found_local_key {
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    topic = %subscription_key.topic_type.topic,
+                    msg_type = %subscription_key.topic_type.msg_type,
+                    filters = ?subscription_key.filters,
+                    "Sending RTDS unsubscribe for untracked exact subscription"
+                );
+                self.send_unsubscribe(subscription_key)?;
             }
         }
 
@@ -403,5 +418,10 @@ impl SubscriptionManager {
         });
 
         Ok(())
+    }
+
+    fn send_unsubscribe(&self, subscription_key: &SubscriptionKey) -> Result<()> {
+        let request = SubscriptionRequest::unsubscribe(vec![subscription_key.to_subscription()]);
+        self.connection.send(&request)
     }
 }

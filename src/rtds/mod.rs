@@ -16,6 +16,8 @@
 //! - **Crypto Prices (Chainlink)**: Price data from Chainlink oracle networks
 //! - **Comments**: Comment events including creations, removals, and reactions
 //! - **Orders Matched**: Public trade matches filtered by event slug
+//! - **Trades**: Public market trades filtered by event slug
+//! - **Equity Prices**: Equity price updates filtered by ticker symbol
 //!
 //! # Example
 //!

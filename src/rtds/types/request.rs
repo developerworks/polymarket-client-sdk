@@ -94,17 +94,40 @@ impl Subscription {
         }
     }
 
+    /// Create a subscription for activity events by event slug and type.
+    #[must_use]
+    pub fn activity(event_slug: impl AsRef<str>, r#type: impl Into<String>) -> Self {
+        Self {
+            topic: "activity".to_owned(),
+            msg_type: r#type.into(),
+            filters: Some(json_string_filter(serde_json::json!({
+                "event_slug": event_slug.as_ref()
+            }))),
+            clob_auth: None,
+        }
+    }
+
     /// Create a subscription for public order matches by event slug.
     #[must_use]
     pub fn orders_matched(event_slug: impl AsRef<str>) -> Self {
-        let filter_object = serde_json::json!({ "event_slug": event_slug.as_ref() });
-        let filters = serde_json::to_string(&filter_object.to_string())
-            .expect("orders_matched filter should serialize");
+        Self::activity(event_slug, "orders_matched")
+    }
 
+    /// Create a subscription for public trades by event slug.
+    #[must_use]
+    pub fn trades(event_slug: impl AsRef<str>) -> Self {
+        Self::activity(event_slug, "trades")
+    }
+
+    /// Create a subscription for equity prices by ticker symbol.
+    #[must_use]
+    pub fn equity_prices(symbol: impl AsRef<str>) -> Self {
         Self {
-            topic: "activity".to_owned(),
-            msg_type: "orders_matched".to_owned(),
-            filters: Some(filters),
+            topic: "equity_prices".to_owned(),
+            msg_type: "*".to_owned(),
+            filters: Some(json_string_filter(serde_json::json!({
+                "symbol": symbol.as_ref()
+            }))),
             clob_auth: None,
         }
     }
@@ -139,6 +162,10 @@ impl Subscription {
         self.filters = Some(filters);
         self
     }
+}
+
+fn json_string_filter(value: serde_json::Value) -> String {
+    serde_json::to_string(&value.to_string()).expect("RTDS JSON string filter should serialize")
 }
 
 // Custom Serialize implementation for Subscription to handle auth fields
@@ -230,15 +257,57 @@ mod tests {
 
     #[test]
     fn serialize_orders_matched_subscription() {
-        let sub = Subscription::orders_matched("btc-updown-5m-1776116700");
+        let sub = Subscription::orders_matched("btc-updown-5m-1777580100");
         let request = SubscriptionRequest::subscribe(vec![sub]);
 
         let json = serde_json::to_string(&request).unwrap();
         assert!(json.contains("\"topic\":\"activity\""));
         assert!(json.contains("\"type\":\"orders_matched\""));
         assert!(
-            json.contains(r#""filters":"{\"event_slug\":\"btc-updown-5m-1776116700\"}""#),
+            json.contains(r#""filters":"{\"event_slug\":\"btc-updown-5m-1777580100\"}""#),
             "orders_matched filters should serialize as escaped JSON string, got: {json}"
+        );
+    }
+
+    #[test]
+    fn serialize_activity_wildcard_subscription() {
+        let sub = Subscription::activity("btc-updown-5m-1777580100", "*");
+        let request = SubscriptionRequest::subscribe(vec![sub]);
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"topic\":\"activity\""));
+        assert!(json.contains("\"type\":\"*\""));
+        assert!(
+            json.contains(r#""filters":"{\"event_slug\":\"btc-updown-5m-1777580100\"}""#),
+            "activity wildcard filters should serialize as escaped JSON string, got: {json}"
+        );
+    }
+
+    #[test]
+    fn serialize_trades_subscription() {
+        let sub = Subscription::trades("btc-updown-5m-1777579200");
+        let request = SubscriptionRequest::subscribe(vec![sub]);
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"topic\":\"activity\""));
+        assert!(json.contains("\"type\":\"trades\""));
+        assert!(
+            json.contains(r#""filters":"{\"event_slug\":\"btc-updown-5m-1777579200\"}""#),
+            "trades filters should serialize as escaped JSON string, got: {json}"
+        );
+    }
+
+    #[test]
+    fn serialize_equity_prices_subscription() {
+        let sub = Subscription::equity_prices("AAPL");
+        let request = SubscriptionRequest::subscribe(vec![sub]);
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"topic\":\"equity_prices\""));
+        assert!(json.contains("\"type\":\"*\""));
+        assert!(
+            json.contains(r#""filters":"{\"symbol\":\"AAPL\"}""#),
+            "equity_prices filters should serialize as escaped JSON string, got: {json}"
         );
     }
 
@@ -338,7 +407,7 @@ mod tests {
 
     #[test]
     fn serialize_unsubscribe_orders_matched() {
-        let sub = Subscription::orders_matched("btc-updown-5m-1776116700");
+        let sub = Subscription::orders_matched("btc-updown-5m-1777580100");
         let request = SubscriptionRequest::unsubscribe(vec![sub]);
 
         let json = serde_json::to_string(&request).unwrap();
@@ -346,8 +415,38 @@ mod tests {
         assert!(json.contains("\"topic\":\"activity\""));
         assert!(json.contains("\"type\":\"orders_matched\""));
         assert!(
-            json.contains(r#""filters":"{\"event_slug\":\"btc-updown-5m-1776116700\"}""#),
+            json.contains(r#""filters":"{\"event_slug\":\"btc-updown-5m-1777580100\"}""#),
             "orders_matched unsubscribe should include filters, got: {json}"
+        );
+    }
+
+    #[test]
+    fn serialize_unsubscribe_trades() {
+        let sub = Subscription::trades("btc-updown-5m-1777579200");
+        let request = SubscriptionRequest::unsubscribe(vec![sub]);
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"action\":\"unsubscribe\""));
+        assert!(json.contains("\"topic\":\"activity\""));
+        assert!(json.contains("\"type\":\"trades\""));
+        assert!(
+            json.contains(r#""filters":"{\"event_slug\":\"btc-updown-5m-1777579200\"}""#),
+            "trades unsubscribe should include filters, got: {json}"
+        );
+    }
+
+    #[test]
+    fn serialize_unsubscribe_equity_prices() {
+        let sub = Subscription::equity_prices("AAPL");
+        let request = SubscriptionRequest::unsubscribe(vec![sub]);
+
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"action\":\"unsubscribe\""));
+        assert!(json.contains("\"topic\":\"equity_prices\""));
+        assert!(json.contains("\"type\":\"*\""));
+        assert!(
+            json.contains(r#""filters":"{\"symbol\":\"AAPL\"}""#),
+            "equity_prices unsubscribe should include filters, got: {json}"
         );
     }
 

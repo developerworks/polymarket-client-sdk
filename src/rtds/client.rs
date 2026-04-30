@@ -210,17 +210,57 @@ impl<S: State> Client<S> {
         &self,
         event_slug: impl Into<String>,
     ) -> Result<impl Stream<Item = Result<RtdsMessage>>> {
+        self.subscribe_activity(event_slug, "orders_matched")
+    }
+
+    /// Subscribe to public trades for a Polymarket event slug.
+    pub fn subscribe_trades(
+        &self,
+        event_slug: impl Into<String>,
+    ) -> Result<impl Stream<Item = Result<RtdsMessage>>> {
+        self.subscribe_activity(event_slug, "trades")
+    }
+
+    /// Subscribe to activity events for a Polymarket event slug and type.
+    pub fn subscribe_activity(
+        &self,
+        event_slug: impl Into<String>,
+        r#type: impl Into<String>,
+    ) -> Result<impl Stream<Item = Result<RtdsMessage>>> {
         let event_slug = event_slug.into();
-        let subscription = Subscription::orders_matched(&event_slug);
+        let r#type = r#type.into();
+        let subscription = Subscription::activity(&event_slug, &r#type);
         let stream = self.inner.subscriptions.subscribe(subscription)?;
 
         Ok(stream.filter_map(move |msg_result| {
             let event_slug = event_slug.clone();
+            let r#type = r#type.clone();
             async move {
                 match msg_result {
-                    Ok(msg) if message_matches_orders_matched_event_slug(&msg, &event_slug) => {
+                    Ok(msg) if message_matches_activity_event_slug(&msg, &event_slug, &r#type) => {
                         Some(Ok(msg))
                     }
+                    Ok(_) => None,
+                    Err(e) => Some(Err(e)),
+                }
+            }
+        }))
+    }
+
+    /// Subscribe to equity prices for a ticker symbol.
+    pub fn subscribe_equity_prices(
+        &self,
+        symbol: impl Into<String>,
+    ) -> Result<impl Stream<Item = Result<RtdsMessage>>> {
+        let symbol = symbol.into();
+        let subscription = Subscription::equity_prices(&symbol);
+        let stream = self.inner.subscriptions.subscribe(subscription)?;
+
+        Ok(stream.filter_map(move |msg_result| {
+            let symbol = symbol.clone();
+            async move {
+                match msg_result {
+                    Ok(msg) if message_matches_equity_symbol(&msg, &symbol) => Some(Ok(msg)),
                     Ok(_) => None,
                     Err(e) => Some(Err(e)),
                 }
@@ -302,6 +342,28 @@ impl<S: State> Client<S> {
         self.inner.subscriptions.unsubscribe_exact(&[subscription])
     }
 
+    /// Unsubscribe from public trades for an event slug.
+    pub fn unsubscribe_trades(&self, event_slug: impl AsRef<str>) -> Result<()> {
+        let subscription = Subscription::trades(event_slug);
+        self.inner.subscriptions.unsubscribe_exact(&[subscription])
+    }
+
+    /// Unsubscribe from activity events for an event slug and type.
+    pub fn unsubscribe_activity(
+        &self,
+        event_slug: impl AsRef<str>,
+        r#type: impl Into<String>,
+    ) -> Result<()> {
+        let subscription = Subscription::activity(event_slug, r#type);
+        self.inner.subscriptions.unsubscribe_exact(&[subscription])
+    }
+
+    /// Unsubscribe from equity prices for a ticker symbol.
+    pub fn unsubscribe_equity_prices(&self, symbol: impl AsRef<str>) -> Result<()> {
+        let subscription = Subscription::equity_prices(symbol);
+        self.inner.subscriptions.unsubscribe_exact(&[subscription])
+    }
+
     /// Unsubscribe from comment events.
     ///
     /// # Arguments
@@ -320,17 +382,56 @@ impl<S: State> Client<S> {
 }
 
 fn message_matches_orders_matched_event_slug(message: &RtdsMessage, event_slug: &str) -> bool {
-    if message.topic != "activity" || message.msg_type != "orders_matched" {
+    message_matches_activity_event_slug(message, event_slug, "orders_matched")
+}
+
+fn message_matches_trades_event_slug(message: &RtdsMessage, event_slug: &str) -> bool {
+    message_matches_activity_event_slug(message, event_slug, "trades")
+}
+
+fn message_matches_activity_event_slug(
+    message: &RtdsMessage,
+    event_slug: &str,
+    r#type: &str,
+) -> bool {
+    if message.topic != "activity" {
+        return false;
+    }
+
+    if r#type != "*" && message.msg_type != r#type {
+        return false;
+    }
+
+    payload_field_matches(
+        &message.payload,
+        &["eventSlug", "event_slug", "slug"],
+        event_slug,
+    )
+}
+
+fn message_matches_equity_symbol(message: &RtdsMessage, symbol: &str) -> bool {
+    if message.topic != "equity_prices" {
         return false;
     }
 
     message
         .payload
-        .get("eventSlug")
-        .or_else(|| message.payload.get("event_slug"))
-        .or_else(|| message.payload.get("slug"))
+        .get("symbol")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| value == event_slug)
+        .is_some_and(|value| value.eq_ignore_ascii_case(symbol))
+}
+
+fn payload_field_matches(
+    payload: &serde_json::Value,
+    candidate_fields: &[&str],
+    expected: &str,
+) -> bool {
+    candidate_fields.iter().any(|field| {
+        payload
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| value == expected)
+    })
 }
 
 #[cfg(test)]
@@ -342,20 +443,20 @@ mod tests {
     #[test]
     fn orders_matched_filter_accepts_event_slug_shapes() {
         for payload in [
-            json!({ "eventSlug": "btc-updown-5m-1776116700" }),
-            json!({ "event_slug": "btc-updown-5m-1776116700" }),
-            json!({ "slug": "btc-updown-5m-1776116700" }),
+            json!({ "eventSlug": "btc-updown-5m-1777580100" }),
+            json!({ "event_slug": "btc-updown-5m-1777580100" }),
+            json!({ "slug": "btc-updown-5m-1777580100" }),
         ] {
             let message = RtdsMessage {
                 topic: "activity".to_owned(),
                 msg_type: "orders_matched".to_owned(),
-                timestamp: 1_776_116_825_000,
+                timestamp: 1_777_580_100_000,
                 payload,
             };
 
             assert!(message_matches_orders_matched_event_slug(
                 &message,
-                "btc-updown-5m-1776116700"
+                "btc-updown-5m-1777580100"
             ));
         }
     }
@@ -365,24 +466,133 @@ mod tests {
         let wrong_slug = RtdsMessage {
             topic: "activity".to_owned(),
             msg_type: "orders_matched".to_owned(),
-            timestamp: 1_776_116_825_000,
-            payload: json!({ "eventSlug": "btc-updown-5m-1776117000" }),
+            timestamp: 1_777_580_100_000,
+            payload: json!({ "eventSlug": "btc-updown-5m-1777580400" }),
         };
         let wrong_topic = RtdsMessage {
             topic: "crypto_prices".to_owned(),
             msg_type: "orders_matched".to_owned(),
-            timestamp: 1_776_116_825_000,
-            payload: json!({ "eventSlug": "btc-updown-5m-1776116700" }),
+            timestamp: 1_777_580_100_000,
+            payload: json!({ "eventSlug": "btc-updown-5m-1777580100" }),
         };
 
         assert!(!message_matches_orders_matched_event_slug(
             &wrong_slug,
-            "btc-updown-5m-1776116700"
+            "btc-updown-5m-1777580100"
         ));
         assert!(!message_matches_orders_matched_event_slug(
             &wrong_topic,
-            "btc-updown-5m-1776116700"
+            "btc-updown-5m-1777580100"
         ));
+    }
+
+    #[test]
+    fn trades_filter_accepts_event_slug_shapes() {
+        for payload in [
+            json!({ "eventSlug": "btc-updown-5m-1777579200" }),
+            json!({ "event_slug": "btc-updown-5m-1777579200" }),
+            json!({ "slug": "btc-updown-5m-1777579200" }),
+        ] {
+            let message = RtdsMessage {
+                topic: "activity".to_owned(),
+                msg_type: "trades".to_owned(),
+                timestamp: 1_777_579_200_000,
+                payload,
+            };
+
+            assert!(message_matches_trades_event_slug(
+                &message,
+                "btc-updown-5m-1777579200"
+            ));
+        }
+    }
+
+    #[test]
+    fn trades_filter_rejects_other_topics_or_slugs() {
+        let wrong_slug = RtdsMessage {
+            topic: "activity".to_owned(),
+            msg_type: "trades".to_owned(),
+            timestamp: 1_777_579_200_000,
+            payload: json!({ "eventSlug": "btc-updown-5m-1777579500" }),
+        };
+        let wrong_type = RtdsMessage {
+            topic: "activity".to_owned(),
+            msg_type: "orders_matched".to_owned(),
+            timestamp: 1_777_579_200_000,
+            payload: json!({ "eventSlug": "btc-updown-5m-1777579200" }),
+        };
+
+        assert!(!message_matches_trades_event_slug(
+            &wrong_slug,
+            "btc-updown-5m-1777579200"
+        ));
+        assert!(!message_matches_trades_event_slug(
+            &wrong_type,
+            "btc-updown-5m-1777579200"
+        ));
+    }
+
+    #[test]
+    fn activity_filter_accepts_wildcard_type() {
+        let message = RtdsMessage {
+            topic: "activity".to_owned(),
+            msg_type: "orders_matched".to_owned(),
+            timestamp: 1_777_580_100_000,
+            payload: json!({ "event_slug": "btc-updown-5m-1777580100" }),
+        };
+
+        assert!(message_matches_activity_event_slug(
+            &message,
+            "btc-updown-5m-1777580100",
+            "*"
+        ));
+    }
+
+    #[test]
+    fn activity_filter_rejects_wrong_exact_type() {
+        let message = RtdsMessage {
+            topic: "activity".to_owned(),
+            msg_type: "orders_matched".to_owned(),
+            timestamp: 1_777_580_100_000,
+            payload: json!({ "event_slug": "btc-updown-5m-1777580100" }),
+        };
+
+        assert!(!message_matches_activity_event_slug(
+            &message,
+            "btc-updown-5m-1777580100",
+            "trades"
+        ));
+    }
+
+    #[test]
+    fn equity_filter_accepts_symbol_case_insensitively() {
+        let message = RtdsMessage {
+            topic: "equity_prices".to_owned(),
+            msg_type: "update".to_owned(),
+            timestamp: 1_777_579_200_000,
+            payload: json!({ "symbol": "AAPL" }),
+        };
+
+        assert!(message_matches_equity_symbol(&message, "aapl"));
+    }
+
+    #[test]
+    fn equity_filter_rejects_other_topics_or_symbols() {
+        let wrong_symbol = RtdsMessage {
+            topic: "equity_prices".to_owned(),
+            msg_type: "update".to_owned(),
+            timestamp: 1_777_579_200_000,
+            payload: json!({ "symbol": "MSFT" }),
+        };
+        let wrong_topic = RtdsMessage {
+            topic: "activity".to_owned(),
+            msg_type: "update".to_owned(),
+            timestamp: 1_777_579_200_000,
+            payload: json!({ "symbol": "AAPL" }),
+        };
+
+        assert!(!message_matches_equity_symbol(&wrong_symbol, "AAPL"));
+        assert!(!message_matches_equity_symbol(&wrong_topic, "AAPL"));
     }
 }
 
