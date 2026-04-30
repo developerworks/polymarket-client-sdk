@@ -12,7 +12,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::time::{interval, sleep, timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
@@ -25,6 +25,10 @@ use crate::ws::WithCredentials;
 use crate::{Result, error::Error};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+struct HeartbeatPingRequest {
+    sent_tx: oneshot::Sender<Instant>,
+}
 
 /// Broadcast channel capacity for incoming messages.
 const BROADCAST_CAPACITY: usize = 1024;
@@ -183,6 +187,7 @@ where
                     // Handle connection
                     if let Err(e) = Self::handle_connection(
                         ws_stream,
+                        endpoint.clone(),
                         &mut sender_rx,
                         &broadcast_tx,
                         state_rx,
@@ -227,6 +232,7 @@ where
     /// Handle an active WebSocket connection.
     async fn handle_connection(
         ws_stream: WsStream,
+        endpoint: String,
         sender_rx: &mut mpsc::UnboundedReceiver<String>,
         broadcast_tx: &broadcast::Sender<M>,
         state_rx: watch::Receiver<ConnectionState>,
@@ -240,7 +246,7 @@ where
         let (ping_tx, mut ping_rx) = mpsc::unbounded_channel();
 
         let heartbeat_handle = tokio::spawn(async move {
-            Self::heartbeat_loop(ping_tx, state_rx, &config, pong_rx).await;
+            Self::heartbeat_loop(ping_tx, state_rx, &config, pong_rx, endpoint).await;
         });
 
         loop {
@@ -300,10 +306,11 @@ where
                 }
 
                 // Handle PING requests from heartbeat loop
-                Some(()) = ping_rx.recv() => {
+                Some(request) = ping_rx.recv() => {
                     if write.send(Message::Text("PING".into())).await.is_err() {
                         break;
                     }
+                    _ = request.sent_tx.send(Instant::now());
                 }
 
                 // Check if connection is still active
@@ -321,12 +328,20 @@ where
 
     /// Heartbeat loop that sends PING messages and monitors PONG responses.
     async fn heartbeat_loop(
-        ping_tx: mpsc::UnboundedSender<()>,
+        ping_tx: mpsc::UnboundedSender<HeartbeatPingRequest>,
         state_rx: watch::Receiver<ConnectionState>,
         config: &Config,
         mut pong_rx: watch::Receiver<Instant>,
+        endpoint: String,
     ) {
+        let _ = &endpoint;
         let mut ping_interval = interval(config.heartbeat_interval);
+        #[cfg(feature = "tracing")]
+        let mut pair_seq = 0_u64;
+        #[cfg(feature = "tracing")]
+        let mut previous_ping_sent: Option<Instant> = None;
+        #[cfg(feature = "tracing")]
+        let mut previous_pong_received: Option<Instant> = None;
 
         loop {
             ping_interval.tick().await;
@@ -340,11 +355,18 @@ where
             // This prevents changed() from returning immediately due to a stale PONG
             drop(pong_rx.borrow_and_update());
 
-            // Send PING request to message loop
-            let ping_sent = Instant::now();
-            if ping_tx.send(()).is_err() {
+            let (sent_tx, sent_rx) = oneshot::channel();
+            if ping_tx.send(HeartbeatPingRequest { sent_tx }).is_err() {
                 // Message loop has terminated
                 break;
+            }
+            let Ok(ping_sent) = sent_rx.await else {
+                // Message loop terminated before writing the PING frame.
+                break;
+            };
+            #[cfg(feature = "tracing")]
+            {
+                pair_seq = pair_seq.saturating_add(1);
             }
 
             // Wait for PONG within timeout
@@ -356,9 +378,34 @@ where
                     if last_pong < ping_sent {
                         #[cfg(feature = "tracing")]
                         tracing::debug!(
+                            endpoint = %endpoint,
+                            heartbeat_pair_seq = pair_seq,
                             "PONG received but older than last PING, connection may be stale"
                         );
                         break;
+                    }
+                    #[cfg(feature = "tracing")]
+                    {
+                        let ping_gap_ms = previous_ping_sent.map(|previous| {
+                            duration_millis(ping_sent.saturating_duration_since(previous))
+                        });
+                        let pong_gap_ms = previous_pong_received.map(|previous| {
+                            duration_millis(last_pong.saturating_duration_since(previous))
+                        });
+                        tracing::debug!(
+                            endpoint = %endpoint,
+                            heartbeat_pair_seq = pair_seq,
+                            ping_gap_ms,
+                            pong_gap_ms,
+                            pong_rtt_ms = duration_millis(
+                                last_pong.saturating_duration_since(ping_sent)
+                            ),
+                            heartbeat_interval_ms = duration_millis(config.heartbeat_interval),
+                            heartbeat_timeout_ms = duration_millis(config.heartbeat_timeout),
+                            "WebSocket heartbeat PONG observed"
+                        );
+                        previous_ping_sent = Some(ping_sent);
+                        previous_pong_received = Some(last_pong);
                     }
                 }
                 Ok(Err(_)) => {
@@ -369,6 +416,18 @@ where
                     // Timeout waiting for PONG
                     #[cfg(feature = "tracing")]
                     tracing::warn!(
+                        endpoint = %endpoint,
+                        heartbeat_pair_seq = pair_seq,
+                        ping_gap_ms = previous_ping_sent.map(|previous| {
+                            duration_millis(ping_sent.saturating_duration_since(previous))
+                        }),
+                        last_pong_gap_ms = previous_pong_received.map(|previous| {
+                            duration_millis(Instant::now().saturating_duration_since(previous))
+                        }),
+                        elapsed_ms =
+                            duration_millis(Instant::now().saturating_duration_since(ping_sent)),
+                        heartbeat_interval_ms = duration_millis(config.heartbeat_interval),
+                        heartbeat_timeout_ms = duration_millis(config.heartbeat_timeout),
                         "Heartbeat timeout: no PONG received within {:?}",
                         config.heartbeat_timeout
                     );
@@ -423,4 +482,9 @@ where
     pub fn state_receiver(&self) -> watch::Receiver<ConnectionState> {
         self.state_tx.subscribe()
     }
+}
+
+#[cfg(feature = "tracing")]
+fn duration_millis(duration: std::time::Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
