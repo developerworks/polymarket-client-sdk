@@ -8,7 +8,7 @@ use crate::auth::Credentials;
 
 /// RTDS subscription request message.
 #[non_exhaustive]
-#[derive(Clone, Debug, Serialize, Builder)]
+#[derive(Clone, Debug, Builder)]
 pub struct SubscriptionRequest {
     /// Action type ("subscribe" or "unsubscribe")
     pub action: SubscriptionAction,
@@ -33,6 +33,31 @@ impl SubscriptionRequest {
             action: SubscriptionAction::Unsubscribe,
             subscriptions,
         }
+    }
+}
+
+impl Serialize for SubscriptionRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap as _;
+
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("action", &self.action)?;
+
+        if matches!(&self.action, SubscriptionAction::Unsubscribe) {
+            let subscriptions = self
+                .subscriptions
+                .iter()
+                .map(Subscription::for_unsubscribe_wire)
+                .collect::<Vec<_>>();
+            map.serialize_entry("subscriptions", &subscriptions)?;
+        } else {
+            map.serialize_entry("subscriptions", &self.subscriptions)?;
+        }
+
+        map.end()
     }
 }
 
@@ -147,6 +172,12 @@ impl Subscription {
             filters: None,
             clob_auth: None,
         }
+    }
+
+    fn for_unsubscribe_wire(&self) -> Self {
+        let mut subscription = self.clone();
+        subscription.filters = None;
+        subscription
     }
 
     /// Set CLOB authentication for this subscription.
@@ -367,6 +398,10 @@ mod tests {
         );
         assert!(json.contains("\"topic\":\"crypto_prices\""));
         assert!(json.contains("\"type\":\"update\""));
+        assert!(
+            !json.contains("\"filters\""),
+            "unsubscribe should omit filters, got: {json}"
+        );
     }
 
     #[test]
@@ -392,6 +427,10 @@ mod tests {
         assert!(json.contains("\"action\":\"unsubscribe\""));
         assert!(json.contains("\"topic\":\"crypto_prices_chainlink\""));
         assert!(json.contains("\"type\":\"*\""));
+        assert!(
+            !json.contains("\"filters\""),
+            "chainlink unsubscribe should omit filters, got: {json}"
+        );
     }
 
     #[test]
@@ -415,8 +454,8 @@ mod tests {
         assert!(json.contains("\"topic\":\"activity\""));
         assert!(json.contains("\"type\":\"orders_matched\""));
         assert!(
-            json.contains(r#""filters":"{\"event_slug\":\"btc-updown-5m-1777580100\"}""#),
-            "orders_matched unsubscribe should include filters, got: {json}"
+            !json.contains("\"filters\""),
+            "orders_matched unsubscribe should omit filters, got: {json}"
         );
     }
 
@@ -430,8 +469,8 @@ mod tests {
         assert!(json.contains("\"topic\":\"activity\""));
         assert!(json.contains("\"type\":\"trades\""));
         assert!(
-            json.contains(r#""filters":"{\"event_slug\":\"btc-updown-5m-1777579200\"}""#),
-            "trades unsubscribe should include filters, got: {json}"
+            !json.contains("\"filters\""),
+            "trades unsubscribe should omit filters, got: {json}"
         );
     }
 
@@ -445,8 +484,8 @@ mod tests {
         assert!(json.contains("\"topic\":\"equity_prices\""));
         assert!(json.contains("\"type\":\"*\""));
         assert!(
-            json.contains(r#""filters":"{\"symbol\":\"AAPL\"}""#),
-            "equity_prices unsubscribe should include filters, got: {json}"
+            !json.contains("\"filters\""),
+            "equity_prices unsubscribe should omit filters, got: {json}"
         );
     }
 
