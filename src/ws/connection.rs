@@ -5,6 +5,8 @@
 
 use std::fmt::Debug;
 use std::marker::PhantomData;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
@@ -12,10 +14,15 @@ use backoff::backoff::Backoff as _;
 use futures::{SinkExt as _, StreamExt as _};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream, lookup_host};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{interval, sleep, timeout};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::client::Response;
+use tokio_tungstenite::tungstenite::{Error as TungsteniteError, Message};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, client_async_tls_with_config, connect_async,
+};
 
 use super::config::Config;
 use super::error::WsError;
@@ -26,6 +33,96 @@ use crate::ws::WithCredentials;
 use crate::{Result, error::Error};
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+static LOCAL_BIND_CURSOR: AtomicUsize = AtomicUsize::new(0);
+
+fn next_local_bind_ip(local_bind_ips: &[IpAddr], prefers_ipv4: bool) -> Option<IpAddr> {
+    if local_bind_ips.is_empty() {
+        return None;
+    }
+
+    let start = LOCAL_BIND_CURSOR.fetch_add(1, Ordering::Relaxed);
+    for step in 0..local_bind_ips.len() {
+        let index = (start + step) % local_bind_ips.len();
+        let ip = local_bind_ips[index];
+        if ip.is_ipv4() == prefers_ipv4 {
+            return Some(ip);
+        }
+    }
+
+    None
+}
+
+fn default_port_from_scheme(scheme: Option<&str>) -> u16 {
+    match scheme {
+        Some("wss") => 443,
+        _ => 80,
+    }
+}
+
+async fn connect_with_optional_local_bind(
+    endpoint: &str,
+    local_bind_ips: &[IpAddr],
+) -> std::result::Result<(WsStream, Response), TungsteniteError> {
+    if local_bind_ips.is_empty() {
+        return connect_async(endpoint).await;
+    }
+
+    let request = endpoint.into_client_request()?;
+    let Some(host) = request.uri().host().map(str::to_owned) else {
+        return connect_async(endpoint).await;
+    };
+    let port = request
+        .uri()
+        .port_u16()
+        .unwrap_or_else(|| default_port_from_scheme(request.uri().scheme_str()));
+
+    let mut remote_addrs = lookup_host((host.as_str(), port))
+        .await
+        .map_err(TungsteniteError::Io)?;
+    let Some(remote_addr) = remote_addrs.next() else {
+        return connect_async(endpoint).await;
+    };
+    let wants_ipv4 = remote_addr.is_ipv4();
+    let Some(local_bind_ip) = next_local_bind_ip(local_bind_ips, wants_ipv4) else {
+        return connect_async(endpoint).await;
+    };
+
+    let socket = if wants_ipv4 {
+        TcpSocket::new_v4().map_err(TungsteniteError::Io)?
+    } else {
+        TcpSocket::new_v6().map_err(TungsteniteError::Io)?
+    };
+
+    if let Err(error) = socket.bind(SocketAddr::new(local_bind_ip, 0)) {
+        #[cfg(feature = "tracing")]
+        tracing::warn!(
+            error = %error,
+            bind_ip = %local_bind_ip,
+            "Unable to bind local egress IP, fallback to default connect path",
+        );
+        #[cfg(not(feature = "tracing"))]
+        let _: &_ = &error;
+        return connect_async(endpoint).await;
+    }
+
+    let stream = match socket.connect(remote_addr).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                error = %error,
+                bind_ip = %local_bind_ip,
+                remote = %remote_addr,
+                "Bound connect failed, fallback to default connect path",
+            );
+            #[cfg(not(feature = "tracing"))]
+            let _: &_ = &error;
+            return connect_async(endpoint).await;
+        }
+    };
+
+    client_async_tls_with_config(request, stream, None, None).await
+}
 
 struct HeartbeatPingRequest {
     sent_tx: oneshot::Sender<Instant>,
@@ -176,7 +273,7 @@ where
             _ = state_tx.send(ConnectionState::Connecting);
 
             // Attempt connection
-            match connect_async(&endpoint).await {
+            match connect_with_optional_local_bind(&endpoint, &config.local_bind_ips).await {
                 Ok((ws_stream, _)) => {
                     attempt = 0;
                     backoff.reset();

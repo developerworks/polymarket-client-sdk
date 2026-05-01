@@ -3,6 +3,7 @@
     reason = "Configuration types intentionally mirror the module name for clarity"
 )]
 
+use std::net::IpAddr;
 use std::time::Duration;
 
 use backoff::{ExponentialBackoff, ExponentialBackoffBuilder};
@@ -23,6 +24,11 @@ pub struct Config {
     pub heartbeat_timeout: Duration,
     /// Reconnection strategy configuration
     pub reconnect: ReconnectConfig,
+    /// Optional local bind IP candidates for outbound WebSocket connections.
+    ///
+    /// When configured with multiple addresses, connections will attempt to
+    /// round-robin across these local IPs by address family.
+    pub local_bind_ips: Vec<IpAddr>,
 }
 
 impl Default for Config {
@@ -31,6 +37,7 @@ impl Default for Config {
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL_DURATION,
             heartbeat_timeout: DEFAULT_HEARTBEAT_TIMEOUT_DURATION,
             reconnect: ReconnectConfig::default(),
+            local_bind_ips: Vec::new(),
         }
     }
 }
